@@ -1,5 +1,7 @@
 # Kiln KV
 
+[![Storage tests](https://github.com/rishgad/kiln-kv/actions/workflows/ci.yml/badge.svg)](https://github.com/rishgad/kiln-kv/actions/workflows/ci.yml)
+
 A C++20 persistent key-value engine for a planned shared build-artifact cache.
 
 **Current status:** an embedded storage engine and command-line tool. Artifact caching and a network service are not implemented yet.
@@ -27,7 +29,7 @@ The build client will construct input fingerprints; the storage engine will pers
 
 ## Build and run
 
-Requires Make and a C++20 compiler. Uses POSIX file APIs and has been validated on macOS arm64; Linux has not yet been validated. No third-party libraries are required.
+Requires Make and a C++20 compiler. Uses POSIX file APIs and has been validated on macOS arm64; the GitHub Actions matrix also validates Linux and macOS builds, correctness tests, and sanitizers. No third-party libraries are required.
 
 ```sh
 make
