@@ -1,0 +1,25 @@
+name: Storage tests
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Build CLI
+        run: make
+      - name: Run storage and recovery tests
+        run: make test
+      - name: Run address and undefined-behavior sanitizers
+        run: make sanitize
