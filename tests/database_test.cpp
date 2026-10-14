@@ -16,16 +16,20 @@
 
 namespace fs = std::filesystem;
 namespace {
+// Small assertion helper: a failed condition aborts the current test group.
 void check(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
 }
 
+// Accept a callable/lambda and verify it throws the engine error type.
 template<class F> void rejects(F operation) {
     bool threw = false;
     try { operation(); } catch (const kiln::Error&) { threw = true; }
     check(threw, "expected kiln::Error");
 }
 
+// Each test owns a unique temporary directory. Cleanup runs on scope exit,
+// including exceptions; no test uses the real project database.
 struct Temp {
     fs::path root;
     Temp() {
@@ -38,6 +42,7 @@ struct Temp {
     fs::path file(std::string_view name = "store.kv") const { return root / name; }
 };
 
+// Change one bit of an existing file byte to test corruption detection.
 void flip_byte(const fs::path& path, std::uint64_t offset) {
     std::fstream file(path, std::ios::in | std::ios::out | std::ios::binary);
     file.seekg(static_cast<std::streamoff>(offset));
@@ -51,6 +56,8 @@ void flip_byte(const fs::path& path, std::uint64_t offset) {
     check(file.good(), "cannot write corrupted byte");
 }
 
+// Exercise the byte-oriented API. Explicit string lengths preserve embedded NULs.
+// Separate scopes close and reopen the database to check recovery.
 void basic_and_binary() {
     Temp temp;
     const std::string binary_key("a\0b", 3), binary_value("x\0y\xff", 4);
@@ -79,6 +86,83 @@ void basic_and_binary() {
     check(db.get("a") == "reborn", "reinsert survives reopen");
 }
 
+// Check immediate visibility, overwrite recovery, and input rejection.
+// Reopen alone is not proof of a physical flush; the contract also relies on fsync.
+void durable_put_and_recovery() {
+    Temp temp;
+    {
+        kiln::Database db(temp.file());
+        db.put("earlier", "pending");
+        db.put_durable("key", "first");
+        check(db.get("key") == "first", "durable put visible on return");
+        db.put_durable("key", "replacement");
+        rejects([&] {
+            db.put_durable(std::string(kiln::Database::max_key_bytes + 1, 'k'), "bad");
+        });
+        check(db.get("key") == "replacement", "invalid durable put preserves state");
+    }
+    kiln::Database reopened(temp.file());
+    check(reopened.get("key") == "replacement", "durable overwrite survives reopen");
+    check(reopened.get("earlier") == "pending", "earlier mutation included in flush");
+    check(reopened.size() == 2, "invalid durable put does not add a key");
+}
+
+// Check the public deletion contract and recovery without another explicit sync.
+// Keep an unrelated key so an accidental broad deletion is detected too.
+void durable_erase_and_recovery() {
+    Temp temp;
+    {
+        kiln::Database db(temp.file());
+        db.put_durable("target", "remove me");
+        db.put_durable("keep", "preserve me");
+
+        check(db.erase_durable("target"), "durable erase returns true for existing key");
+        check(!db.get("target"), "durable erase immediately removes key");
+        check(db.size() == 1, "durable erase updates live-key count");
+        check(!db.erase_durable("target"), "repeated durable erase returns false");
+        check(!db.erase_durable("never-present"), "missing durable erase returns false");
+        check(db.get("keep") == "preserve me", "durable erase preserves unrelated key");
+
+        // Invalid input must throw, leave valid data intact, and keep the instance usable.
+        rejects([&] {
+            db.erase_durable(std::string(kiln::Database::max_key_bytes + 1, 'k'));
+        });
+        check(db.get("keep") == "preserve me", "invalid durable erase preserves state");
+    }
+
+    kiln::Database reopened(temp.file());
+    check(!reopened.get("target"), "durable deletion survives reopen");
+    check(reopened.get("keep") == "preserve me", "unrelated value survives reopen");
+    check(reopened.size() == 1, "recovered live-key count reflects deletion");
+
+    // A tombstone must not prevent the same key from being inserted again.
+    reopened.put_durable("target", "new value");
+    check(reopened.get("target") == "new value", "reinsert after durable erase works");
+}
+
+// The missing-key path can follow an earlier unsynced deletion.
+// Reopen checks recovered state, not whether fsync was actually called: kernel
+// caches can preserve unsynced data. Sync ordering also needs code review;
+// a deterministic sync-failure test would need an I/O fault-injection mechanism.
+void durable_erase_after_pending_delete() {
+    Temp temp;
+    {
+        kiln::Database db(temp.file());
+        db.put_durable("target", "old value");
+        check(db.erase("target"), "ordinary erase creates pending tombstone");
+        db.put("earlier", "pending value");
+
+        check(!db.erase_durable("target"), "already-deleted key returns false");
+        check(!db.get("target"), "already-deleted key remains absent");
+    }
+
+    kiln::Database reopened(temp.file());
+    check(!reopened.get("target"), "pending tombstone remains applied after reopen");
+    check(reopened.get("earlier") == "pending value", "earlier mutation recovers too");
+}
+
+// A simple map is the reference model. A fixed seed makes failures reproducible.
+// Periodically discard the engine instance and compare all recovered live keys.
 void deterministic_model() {
     Temp temp;
     std::mt19937 random(0xC0FFEE);
@@ -114,6 +198,8 @@ void deterministic_model() {
     }
 }
 
+// Model an interrupted append by cutting its suffix at every byte boundary.
+// Verify the old value remains and the repaired file accepts new writes.
 void every_tail_truncation() {
     Temp temp;
     const auto source = temp.file("source.kv");
@@ -160,6 +246,7 @@ void every_tail_truncation() {
     }
 }
 
+// Complete damaged records must fail, rather than be mistaken for missing tails.
 void corruption_is_reported() {
     Temp temp;
     const auto source = temp.file("source.kv");
@@ -184,6 +271,7 @@ void corruption_is_reported() {
     rejects([&] { static_cast<void>(db.get("key")); });
 }
 
+// Rejected inputs must not mutate or poison the store; a second owner is rejected.
 void limits_and_ownership() {
     Temp temp;
     kiln::Database db(temp.file());
@@ -200,6 +288,7 @@ void limits_and_ownership() {
     rejects([&] { kiln::Database bad(temp.root / "missing" / "store.kv"); });
 }
 
+// Wait for a child and collect its exit/signal status, retrying signal interruptions.
 int reap(pid_t child) {
     int status = 0;
     while (::waitpid(child, &status, 0) < 0) {
@@ -209,6 +298,8 @@ int reap(pid_t child) {
     return status;
 }
 
+// Use a subprocess so a file-size resource limit cannot affect other tests.
+// Allow a full record header but only part of its key, causing a real write failure.
 void failed_append_requires_recovery() {
     Temp temp;
     std::uint64_t prefix = 0;
@@ -223,14 +314,17 @@ void failed_append_requires_recovery() {
     if (child == 0) {
         try {
             kiln::Database db(temp.file());
+            // Ignoring this signal lets pwrite return an error that the engine can handle.
             ::signal(SIGXFSZ, SIG_IGN);
             struct rlimit limit {};
             if (::getrlimit(RLIMIT_FSIZE, &limit) != 0) ::_exit(2);
+            // 24 is the on-disk record header length; two extra bytes force a partial key.
             limit.rlim_cur = static_cast<rlim_t>(prefix + 24 + 2);
             if (::setrlimit(RLIMIT_FSIZE, &limit) != 0) ::_exit(3);
-            rejects([&] { db.put("broken", "unfinished"); });
+            rejects([&] { db.put_durable("broken", "unfinished"); });
             rejects([&] { db.put("later", "must not append"); });
             rejects([&] { db.sync(); });
+            // Exit without C++ destructor cleanup, leaving the failed append for recovery.
             ::_exit(0);
         } catch (...) { ::_exit(4); }
     }
@@ -243,6 +337,8 @@ void failed_append_requires_recovery() {
     db.sync();
 }
 
+// A pipe tells the parent that put_durable returned before it sends SIGKILL.
+// Killing the child skips destructor cleanup but does not simulate power loss.
 void synced_data_survives_process_kill() {
     Temp temp;
     int ready[2];
@@ -254,14 +350,15 @@ void synced_data_survives_process_kill() {
         try {
             kiln::Database db(temp.file());
             db.put("old", "deleted");
-            db.put("durable", "acknowledged");
             db.erase("old");
-            db.sync();
+            db.put_durable("durable", "acknowledged");
+            // Send readiness only after durability acknowledgment; then remain alive to be killed.
             const char message = 'R';
             if (::write(ready[1], &message, 1) != 1) ::_exit(2);
             for (;;) ::pause();
         } catch (...) { ::_exit(3); }
     }
+    // The parent closes its own write end so child failure can produce EOF on read.
     ::close(ready[1]);
     char message = 0;
     ssize_t received;
@@ -277,9 +374,13 @@ void synced_data_survives_process_kill() {
 }
 } // namespace
 
+// Run named test groups; the first failure prints its context and exits nonzero.
 int main() {
     const std::pair<const char*, std::function<void()>> tests[] = {
         {"basic and binary values", basic_and_binary},
+        {"durable put visibility, overwrite, and recovery", durable_put_and_recovery},
+        {"durable erase results, recovery, and validation", durable_erase_and_recovery},
+        {"durable erase after an earlier pending deletion", durable_erase_after_pending_delete},
         {"deterministic reference model (seed 0xC0FFEE, 3000 operations)", deterministic_model},
         {"every final-record truncation boundary", every_tail_truncation},
         {"corruption detection at every byte", corruption_is_reported},
@@ -294,5 +395,5 @@ int main() {
             return 1;
         }
     }
-    std::cout << "All 7 test groups passed.\n";
+    std::cout << "All 10 test groups passed.\n";
 }

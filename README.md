@@ -20,7 +20,7 @@ The build client will construct input fingerprints; the storage engine will pers
 - Insert, overwrite, retrieve, and delete byte keys and values.
 - Append-only disk storage with an in-memory index.
 - Independent header and record checksums.
-- Explicit synchronization for persistence.
+- Explicit synchronization for persistence, plus `put_durable` for immediate durable acknowledgment.
 - Restart recovery, including incomplete final-record repair.
 - Exclusive file ownership through an advisory lock.
 - A CLI and deterministic correctness tests.
@@ -54,8 +54,7 @@ Use a new file name to start with an empty database. The parent directory must a
 #include "kiln/database.hpp"
 
 kiln::Database db("example.kv");
-db.put("key", "value");
-db.sync();
+db.put_durable("key", "value"); // Returns after append and sync succeed
 
 auto value = db.get("key"); // std::optional<std::string>
 bool removed = db.erase("key");
@@ -65,8 +64,10 @@ db.sync();
 | Operation | Behavior |
 |---|---|
 | `put(key, value)` | Insert or replace a value; visible after successful return |
+| `put_durable(key, value)` | Insert or replace, then sync before successful return |
 | `get(key)` | Return a value, or `std::nullopt` when absent |
 | `erase(key)` | Delete an existing key; return whether it existed |
+| `erase_durable(key)` | Delete if present, then sync even if absent; return whether it existed |
 | `size()` | Return the number of live keys |
 | `sync()` | Flush the file and parent directory using `fsync` |
 
@@ -90,6 +91,8 @@ See [the file-format specification](docs/file-format.md) for record layouts and 
 
 `put` and `erase` make a mutation visible in the current process; they do not acknowledge durability. A successful `sync` is the persistence boundary, subject to operating system, filesystem, and device guarantees. The CLI syncs mutations before reporting success. Closing the database does not substitute for `sync`.
 
+`put_durable` combines `put` and `sync`. Successful return means the value is visible through the index and the sync completed. It also flushes earlier pending mutations in the same file. It adds a flush to each call; use separate `put` calls followed by one `sync` when batching is appropriate. It does not add transaction atomicity or rollback on failure.
+
 Recovery discards an incomplete final record and flushes the repair before admitting new writes. Invalid complete headers and checksum mismatches produce errors instead of silently discarding records. This recovery model assumes a valid prior prefix followed by an interrupted append; it does not guarantee automatic repair of arbitrary corruption.
 
 A failed append or sync makes the instance unusable until reopened. A failed mutation may still have reached the log; recovery determines the resulting state. Invalid input rejected before writing does not poison the instance.
@@ -101,6 +104,8 @@ One instance may own a database file at a time. Operations on an instance are no
 The test suite covers:
 
 - Binary data, empty values, overwrites, deletion, and reinsertion across reopen.
+- Durable put visibility, overwrite recovery, and invalid-input rejection.
+- Durable erase return values, deletion recovery, pending-deletion retry, and invalid-input rejection.
 - 3,000 deterministic operations compared against a reference map, with periodic reopen and state checks.
 - Every truncation boundary in a final put or tombstone, including writes after repair.
 - Single-bit corruption at every byte of a sample file, plus corruption during a live read.
